@@ -1,0 +1,60 @@
+seed: 2021
+device: cpu
+timesteps: 2
+model:
+  img_size_h: 16
+  img_size_w: 16
+  in_channels: 2
+  num_classes: 4
+  embed_dims: 16
+  mlp_ratio: 1.0
+  num_heads: 2
+  T: 2
+dataset:
+  name: synthetic
+  T: 2
+  height: 16
+  width: 16
+  num_classes: 4
+  num_samples: 2
+  batch_size: 1
+  workers: 0
+  noise_prob: 0.001
+predictive:
+  enabled: true
+  stage: stage1
+  stages: [stage1]
+  history: 1
+  predictor_type: conv1x1
+  loss_type: l1
+  loss_weight: 0.01
+  loss_reduction: mean
+  stage_loss_weights:
+    stage1: 1.0
+  target: latent
+  stop_gradient_target: true
+modulation:
+  enabled: false
+  stage: stage1
+  stages: [stage1]
+  mode: membrane_gain
+  alpha: 0.1
+early_exit:
+  enabled: false
+  confidence_thresholds: [0.7, 0.8, 0.9, 0.95]
+  prediction_error_thresholds: []
+profiling:
+  enabled: true
+  save_logits_over_time: false
+  save_stage_activity: true
+  save_layer_activity: true
+  save_membrane_samples: false
+  profile_batches: 1
+training:
+  epochs: 1
+  amp: false
+  label_smoothing: 0.0
+  spike_l1_weight: 0.0
+optimizer:
+  lr: 0.001
+  weight_decay: 0.01

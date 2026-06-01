@@ -1,0 +1,59 @@
+seed: 2021
+device: cuda
+timesteps: 8
+model:
+  img_size_h: 128
+  img_size_w: 128
+  in_channels: 2
+  num_classes: 11
+  embed_dims: 128
+  mlp_ratio: 1.0
+  num_heads: 16
+  T: 8
+dataset:
+  name: dvs128gesture
+  root: /path/to/DVS128Gesture
+  T: 8
+  split_by: number
+  batch_size: 16
+  workers: 4
+  pin_memory: true
+predictive:
+  enabled: true
+  stage: stage1
+  stages: [stage1]
+  history: 2
+  predictor_type: depthwise_conv
+  loss_type: l1
+  loss_weight: 0.01
+  loss_reduction: mean
+  stage_loss_weights:
+    stage1: 1.0
+  target: latent
+  stop_gradient_target: true
+modulation:
+  enabled: true
+  stage: stage1
+  stages: [stage1]
+  mode: membrane_gain
+  alpha: 0.1
+early_exit:
+  enabled: false
+  confidence_thresholds: [0.7, 0.8, 0.9, 0.95]
+  prediction_error_thresholds: []
+profiling:
+  enabled: true
+  save_logits_over_time: true
+  max_logits_batches: 8
+  save_stage_activity: true
+  save_layer_activity: true
+  save_membrane_samples: false
+  profile_batches: 0
+training:
+  epochs: 100
+  amp: true
+  label_smoothing: 0.1
+  spike_l1_weight: 0.0
+optimizer:
+  lr: 0.005
+  weight_decay: 0.06
