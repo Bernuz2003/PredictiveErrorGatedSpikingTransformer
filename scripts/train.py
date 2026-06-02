@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 from pathlib import Path
 
 import torch
@@ -23,8 +24,40 @@ def parse_args():
     p.add_argument("--config", required=True)
     p.add_argument("--output-dir", required=True)
     p.add_argument("--resume", default="")
+    p.add_argument("--init-checkpoint", default="")
     p.add_argument("--profile-batches", type=int, default=0)
     return p.parse_args()
+
+
+def load_initial_weights(model, checkpoint_path: str, strict: bool = False) -> None:
+    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+    model.load_state_dict(state, strict=strict)
+
+
+def configure_trainable_parameters(model, cfg: dict) -> list[torch.nn.Parameter]:
+    train_cfg = cfg.get("training", {})
+    if train_cfg.get("train_predictors_only", False):
+        for param in model.parameters():
+            param.requires_grad_(False)
+        for module_name in ("predictors",):
+            module = getattr(model, module_name, None)
+            if module is not None:
+                for param in module.parameters():
+                    param.requires_grad_(True)
+    else:
+        if train_cfg.get("freeze_backbone", False) and hasattr(model, "backbone"):
+            for param in model.backbone.parameters():
+                param.requires_grad_(False)
+        if train_cfg.get("freeze_classifier", False) and hasattr(model, "backbone"):
+            classifier = getattr(model.backbone, "head", None)
+            if classifier is not None:
+                for param in classifier.parameters():
+                    param.requires_grad_(False)
+    params = [param for param in model.parameters() if param.requires_grad]
+    if not params:
+        raise ValueError("No trainable parameters remain after applying training freeze options.")
+    return params
 
 
 def prediction_error_rows(epoch: int, metrics: dict[str, float], split: str) -> list[dict[str, float | int | str]]:
@@ -41,10 +74,13 @@ def prediction_error_rows(epoch: int, metrics: dict[str, float], split: str) -> 
                 "mode": "end_to_end",
                 "normalized_error": value,
                 "symmetric_normalized_error": value,
-                "raw_error_mean": "",
-                "target_abs_mean": "",
-                "prediction_abs_mean": "",
+                "raw_error_mean": metrics.get(f"prediction_raw_error_{stage}", ""),
+                "target_abs_mean": metrics.get(f"prediction_target_abs_{stage}", ""),
+                "prediction_abs_mean": metrics.get(f"prediction_abs_{stage}", ""),
+                "prediction_abs_ratio": metrics.get(f"prediction_abs_ratio_{stage}", ""),
                 "loss": metrics.get(f"prediction_loss_{stage}", ""),
+                "base_loss": metrics.get(f"prediction_base_loss_{stage}", ""),
+                "amplitude_loss": metrics.get(f"prediction_amplitude_loss_{stage}", ""),
             }
         )
     return rows
@@ -80,6 +116,11 @@ def main() -> None:
     if args.resume:
         resume_ckpt = torch.load(args.resume, map_location="cpu")
         model.load_state_dict(resume_ckpt["model"] if "model" in resume_ckpt else resume_ckpt)
+    else:
+        init_checkpoint = args.init_checkpoint or cfg.get("training", {}).get("init_checkpoint", "")
+        if init_checkpoint:
+            load_initial_weights(model, init_checkpoint, strict=bool(cfg.get("training", {}).get("init_strict", False)))
+    trainable_params = configure_trainable_parameters(model, cfg)
     save_parameter_summary(model, out_dir)
     train_loader = build_dataloader(cfg["dataset"], "train")
     val_loader = build_dataloader(cfg["dataset"], "test")
@@ -87,14 +128,14 @@ def main() -> None:
     opt_type = opt_cfg.get("type", opt_cfg.get("opt", "adamw"))
     if opt_type == "sgd":
         optimizer = torch.optim.SGD(
-            model.parameters(),
+            trainable_params,
             lr=float(opt_cfg.get("lr", 1e-3)),
             momentum=float(opt_cfg.get("momentum", 0.9)),
             weight_decay=float(opt_cfg.get("weight_decay", 0.06)),
         )
     else:
         optimizer = torch.optim.AdamW(
-            model.parameters(),
+            trainable_params,
             lr=float(opt_cfg.get("lr", 1e-3)),
             weight_decay=float(opt_cfg.get("weight_decay", 0.06)),
             eps=float(opt_cfg.get("eps", 1e-8)),
@@ -117,6 +158,10 @@ def main() -> None:
         "aux_loss",
         "acc1",
         "prediction_error_mean",
+        "prediction_loss_scale",
+        "grad_norm_ce",
+        "grad_norm_pred",
+        "grad_ratio_pred_ce",
         "lr",
         "num_samples",
         "val_loss",
@@ -126,7 +171,18 @@ def main() -> None:
         "val_prediction_error_mean",
     ]
     for stage in cfg.get("predictive", {}).get("stages", []):
-        metric_fields.extend([f"prediction_error_{stage}", f"prediction_loss_{stage}"])
+        metric_fields.extend(
+            [
+                f"prediction_error_{stage}",
+                f"prediction_loss_{stage}",
+                f"prediction_base_loss_{stage}",
+                f"prediction_amplitude_loss_{stage}",
+                f"prediction_raw_error_{stage}",
+                f"prediction_target_abs_{stage}",
+                f"prediction_abs_{stage}",
+                f"prediction_abs_ratio_{stage}",
+            ]
+        )
     all_prediction_rows: list[dict[str, float | int | str]] = []
     all_prediction_timestep_rows: list[dict[str, float | int | str]] = []
     all_modulation_rows: list[dict[str, float | int | str]] = []
@@ -189,7 +245,10 @@ def main() -> None:
                 "raw_error_mean",
                 "target_abs_mean",
                 "prediction_abs_mean",
+                "prediction_abs_ratio",
                 "loss",
+                "base_loss",
+                "amplitude_loss",
             ],
         )
         for item in eval_prediction_timestep_rows:
@@ -230,6 +289,49 @@ def main() -> None:
         if val_summary["acc1"] > best_acc:
             best_acc = val_summary["acc1"]
             torch.save(state, out_dir / "checkpoint_best.pt")
+            write_json(out_dir / "metrics_best.json", row)
+            write_csv(out_dir / "timestep_metrics_best.csv", timestep_rows)
+            write_csv(out_dir / "confusion_matrix_best.csv", confusion_rows)
+            write_csv(
+                out_dir / "prediction_error_best.csv",
+                [{"epoch": epoch, **item} for item in eval_prediction_rows],
+                fieldnames=[
+                    "epoch",
+                    "split",
+                    "stage",
+                    "mode",
+                    "normalized_error",
+                    "symmetric_normalized_error",
+                    "raw_error_mean",
+                    "target_abs_mean",
+                    "prediction_abs_mean",
+                    "prediction_abs_ratio",
+                    "loss",
+                    "base_loss",
+                    "amplitude_loss",
+                ],
+            )
+            write_csv(
+                out_dir / "prediction_timestep_error_best.csv",
+                [{"epoch": epoch, **item} for item in eval_prediction_timestep_rows],
+                fieldnames=[
+                    "epoch",
+                    "split",
+                    "stage",
+                    "timestep",
+                    "loss",
+                    "raw_error_mean",
+                    "normalized_error",
+                    "symmetric_normalized_error",
+                    "target_abs_mean",
+                    "prediction_abs_mean",
+                ],
+            )
+            write_csv(out_dir / "modulation_stats_best.csv", [{"epoch": epoch, **item} for item in eval_modulation_rows], fieldnames=["epoch", "split", "stage", "stat", "value"])
+            for name in ("logits_over_time", "prediction_sample_scores"):
+                src = out_dir / f"{name}.pt"
+                if src.exists():
+                    shutil.copyfile(src, out_dir / f"{name}_best.pt")
         print(f"epoch={epoch} train_acc={train_metrics['acc1']:.2f} val_acc={val_summary['acc1']:.2f} aux={train_metrics['aux_loss']:.5f}")
 
     profile_batches = args.profile_batches

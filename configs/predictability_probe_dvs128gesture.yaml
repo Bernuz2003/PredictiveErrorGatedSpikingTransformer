@@ -23,8 +23,10 @@ predictive:
   stages: [stage1]
   history: 2
   predictor_type: depthwise_conv
-  loss_type: l1
+  loss_type: smooth_l1
   loss_weight: 0.0
+  normalize_loss: true
+  amplitude_loss_weight: 0.05
   loss_reduction: mean
   stage_loss_weights:
     stage1: 1.0

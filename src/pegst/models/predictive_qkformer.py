@@ -20,6 +20,10 @@ class PredictiveConfig:
     hidden_ratio: float = 1.0
     loss_type: str = "l1"
     loss_weight: float = 0.01
+    warmup_epochs: int = 0
+    ramp_epochs: int = 0
+    normalize_loss: bool = False
+    amplitude_loss_weight: float = 0.0
     loss_reduction: str = "mean"
     stage_loss_weights: dict[str, float] = field(default_factory=dict)
     target: str = "latent"
@@ -122,6 +126,8 @@ class PredictiveQKFormer(nn.Module):
         pred_loss_unweighted = torch.tensor(0.0, device=x.device)
         pred_norm_errors: dict[str, torch.Tensor] = {}
         pred_stage_losses: dict[str, torch.Tensor] = {}
+        pred_base_losses: dict[str, torch.Tensor] = {}
+        pred_amplitude_losses: dict[str, torch.Tensor] = {}
         if self.predictive_cfg.enabled:
             weight_sum = 0.0
             for stage, predictor in self.predictors.items():
@@ -131,12 +137,16 @@ class PredictiveQKFormer(nn.Module):
                     collected[stage],
                     loss_type=self.predictive_cfg.loss_type,  # type: ignore[arg-type]
                     stop_gradient_target=self.predictive_cfg.stop_gradient_target,
+                    normalize_loss=self.predictive_cfg.normalize_loss,
+                    amplitude_loss_weight=self.predictive_cfg.amplitude_loss_weight,
                 )
                 prediction_batches[stage] = batch
                 stage_weight = float(self.predictive_cfg.stage_loss_weights.get(stage, 1.0))
                 pred_loss_unweighted = pred_loss_unweighted + batch.loss * stage_weight
                 weight_sum += stage_weight
                 pred_stage_losses[stage] = batch.loss.detach()
+                pred_base_losses[stage] = batch.base_loss.detach()
+                pred_amplitude_losses[stage] = batch.amplitude_loss.detach()
                 pred_norm_errors[stage] = batch.normalized_error
             if self.predictive_cfg.loss_reduction == "mean" and weight_sum > 0:
                 pred_loss_unweighted = pred_loss_unweighted / weight_sum
@@ -152,6 +162,8 @@ class PredictiveQKFormer(nn.Module):
             "prediction_loss": pred_loss,
             "prediction_loss_unweighted": pred_loss_unweighted.detach(),
             "prediction_stage_losses": pred_stage_losses,
+            "prediction_base_losses": pred_base_losses,
+            "prediction_amplitude_losses": pred_amplitude_losses,
             "prediction_normalized_errors": pred_norm_errors,
             "modulation_stats": mod_stats,
         }

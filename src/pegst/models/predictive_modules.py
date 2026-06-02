@@ -7,7 +7,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-PredictionLossType = Literal["l1", "mse", "smooth_l1"]
+PredictionLossType = Literal["l1", "mse", "smooth_l1", "normalized_l1", "normalized_mse", "normalized_smooth_l1"]
 
 
 @dataclass
@@ -21,6 +21,8 @@ class PredictionBatch:
     raw_error_mean: torch.Tensor
     target_abs_mean: torch.Tensor
     prediction_abs_mean: torch.Tensor
+    base_loss: torch.Tensor
+    amplitude_loss: torch.Tensor
     sample_normalized_error: torch.Tensor
     timestep_normalized_error: torch.Tensor
     timestep_raw_error: torch.Tensor
@@ -46,13 +48,20 @@ class FutureStatePredictor(nn.Module):
         super().__init__()
         if history < 1:
             raise ValueError("history must be >= 1")
+        if predictor_type == "motion_extrapolation" and history < 2:
+            raise ValueError("motion_extrapolation predictor requires history >= 2")
         self.channels = int(channels)
         self.history = int(history)
         self.spatial = bool(spatial)
+        self.predictor_type = predictor_type
         hidden = max(channels, int(channels * hidden_ratio))
         in_channels = channels * history
         if spatial:
-            if predictor_type == "depthwise_conv":
+            if predictor_type == "motion_extrapolation":
+                self.motion_a = nn.Parameter(torch.ones(1, channels, 1, 1))
+                self.motion_b = nn.Parameter(torch.zeros(1, channels, 1, 1))
+                self.net = nn.Identity()
+            elif predictor_type == "depthwise_conv":
                 self.net = nn.Sequential(
                     nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, groups=in_channels, bias=False),
                     nn.BatchNorm2d(in_channels),
@@ -69,7 +78,11 @@ class FutureStatePredictor(nn.Module):
             else:
                 self.net = nn.Conv2d(in_channels, channels, kernel_size=1, bias=True)
         else:
-            if predictor_type == "mlp_conv":
+            if predictor_type == "motion_extrapolation":
+                self.motion_a = nn.Parameter(torch.ones(1, channels))
+                self.motion_b = nn.Parameter(torch.zeros(1, channels))
+                self.net = nn.Identity()
+            elif predictor_type == "mlp_conv":
                 self.net = nn.Sequential(nn.Linear(in_channels, hidden), nn.SiLU(), nn.Linear(hidden, channels))
             else:
                 self.net = nn.Linear(in_channels, channels)
@@ -88,33 +101,62 @@ class FutureStatePredictor(nn.Module):
         target = x[1:]
         return src, target
 
+    @staticmethod
+    def _normalize_for_loss(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        reduce_dims = tuple(range(2, x.dim()))
+        scale = x.square().mean(dim=reduce_dims, keepdim=True).sqrt().clamp_min(eps)
+        return x / scale
+
+    def _motion_extrapolation(self, src: torch.Tensor) -> torch.Tensor:
+        if self.spatial:
+            current = src[:, :, -self.channels :]
+            previous = src[:, :, -2 * self.channels : -self.channels]
+        else:
+            current = src[:, :, -self.channels :]
+            previous = src[:, :, -2 * self.channels : -self.channels]
+        return self.motion_a * current + self.motion_b * (current - previous)
+
     def forward_sequence(
         self,
         x: torch.Tensor,
         loss_type: PredictionLossType = "l1",
         stop_gradient_target: bool = True,
         normalize_error: bool = True,
+        normalize_loss: bool = False,
+        amplitude_loss_weight: float = 0.0,
     ) -> PredictionBatch:
         src, target = self.make_history(x)
         if stop_gradient_target:
             target_for_loss = target.detach()
         else:
             target_for_loss = target
-        if self.spatial:
+        if self.predictor_type == "motion_extrapolation":
+            pred = self._motion_extrapolation(src)
+        elif self.spatial:
             Tm1, B, Ck, H, W = src.shape
             pred = self.net(src.flatten(0, 1)).reshape(Tm1, B, self.channels, H, W)
         else:
             Tm1, B, Ck = src.shape
             pred = self.net(src.reshape(Tm1 * B, Ck)).reshape(Tm1, B, self.channels)
-        if loss_type == "mse":
-            raw = F.mse_loss(pred, target_for_loss, reduction="none")
-        elif loss_type == "smooth_l1":
-            raw = F.smooth_l1_loss(pred, target_for_loss, reduction="none")
+        base_loss_type = loss_type
+        if str(loss_type).startswith("normalized_"):
+            normalize_loss = True
+            base_loss_type = str(loss_type).removeprefix("normalized_")  # type: ignore[assignment]
+        pred_for_loss = self._normalize_for_loss(pred) if normalize_loss else pred
+        target_for_base_loss = self._normalize_for_loss(target_for_loss) if normalize_loss else target_for_loss
+        if base_loss_type == "mse":
+            raw = F.mse_loss(pred_for_loss, target_for_base_loss, reduction="none")
+        elif base_loss_type == "smooth_l1":
+            raw = F.smooth_l1_loss(pred_for_loss, target_for_base_loss, reduction="none")
         else:
-            raw = F.l1_loss(pred, target_for_loss, reduction="none")
+            raw = F.l1_loss(pred_for_loss, target_for_base_loss, reduction="none")
         per_sample = raw.flatten(2).mean(dim=2)
         timestep_loss = per_sample.mean(dim=1)
-        loss = per_sample.mean()
+        base_loss = per_sample.mean()
+        pred_amp = pred.abs().flatten(2).mean(dim=2)
+        target_amp = target_for_loss.abs().flatten(2).mean(dim=2)
+        amplitude_loss = (pred_amp - target_amp).abs().mean()
+        loss = base_loss + float(amplitude_loss_weight) * amplitude_loss
         error = (pred - target).detach()
         raw_error = error.abs().flatten(2).mean(dim=2)
         target_abs = target.detach().abs().flatten(2).mean(dim=2)
@@ -132,6 +174,8 @@ class FutureStatePredictor(nn.Module):
             raw_error_mean=raw_error.mean().detach(),
             target_abs_mean=target_abs.mean().detach(),
             prediction_abs_mean=prediction_abs.mean().detach(),
+            base_loss=base_loss.detach(),
+            amplitude_loss=amplitude_loss.detach(),
             sample_normalized_error=sample_normalized_error.detach(),
             timestep_normalized_error=sample_normalized_error.mean(dim=1).detach(),
             timestep_raw_error=raw_error.mean(dim=1).detach(),

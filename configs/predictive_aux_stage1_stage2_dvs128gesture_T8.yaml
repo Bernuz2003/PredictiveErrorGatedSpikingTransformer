@@ -25,8 +25,12 @@ predictive:
   stages: [stage1, stage2]
   history: 2
   predictor_type: depthwise_conv
-  loss_type: l1
-  loss_weight: 0.01
+  loss_type: smooth_l1
+  loss_weight: 0.05
+  warmup_epochs: 20
+  ramp_epochs: 20
+  normalize_loss: true
+  amplitude_loss_weight: 0.05
   loss_reduction: mean
   stage_loss_weights:
     stage1: 1.0
@@ -72,6 +76,7 @@ training:
   label_smoothing: 0.1
   spike_l1_weight: 0.0
   T_train: null
+  grad_ratio_every: 20
 optimizer:
   type: adamw
   lr: 0.001

@@ -14,6 +14,34 @@ from pegst.training.losses import classification_loss, spike_l1_regularizer
 from pegst.training.metrics import accuracy, confidence_entropy, timestep_accuracy
 
 
+def prediction_loss_scale(epoch: int, cfg: dict[str, Any]) -> float:
+    pred_cfg = cfg.get("predictive", {})
+    if not pred_cfg.get("enabled", False):
+        return 1.0
+    warmup_epochs = int(pred_cfg.get("warmup_epochs", 0) or 0)
+    ramp_epochs = int(pred_cfg.get("ramp_epochs", 0) or 0)
+    if epoch < warmup_epochs:
+        return 0.0
+    if ramp_epochs <= 0:
+        return 1.0
+    progress = (epoch - warmup_epochs) / float(ramp_epochs)
+    return max(0.0, min(1.0, progress))
+
+
+def _grad_norm(loss: torch.Tensor, params: list[torch.nn.Parameter]) -> float:
+    grads = torch.autograd.grad(loss, params, retain_graph=True, allow_unused=True)
+    norm_sq = torch.tensor(0.0, device=loss.device)
+    for grad in grads:
+        if grad is not None:
+            norm_sq = norm_sq + grad.detach().float().square().sum()
+    return float(norm_sq.sqrt().item())
+
+
+def _shared_grad_params(model: nn.Module) -> list[torch.nn.Parameter]:
+    shared = getattr(model, "backbone", model)
+    return [p for p in shared.parameters() if p.requires_grad]
+
+
 def run_epoch(
     model: nn.Module,
     loader,
@@ -27,6 +55,9 @@ def run_epoch(
 ) -> dict[str, float]:
     train = optimizer is not None
     model.train(train)
+    train_cfg = cfg.get("training", {})
+    if train and (train_cfg.get("freeze_backbone", False) or train_cfg.get("train_predictors_only", False)) and hasattr(model, "backbone"):
+        model.backbone.eval()
     total_loss = 0.0
     total_ce = 0.0
     total_aux = 0.0
@@ -36,6 +67,11 @@ def run_epoch(
     pred_error_counts: dict[str, int] = defaultdict(int)
     pred_loss_sums: dict[str, float] = defaultdict(float)
     pred_loss_counts: dict[str, int] = defaultdict(int)
+    pred_base_loss_sums: dict[str, float] = defaultdict(float)
+    pred_amplitude_loss_sums: dict[str, float] = defaultdict(float)
+    pred_raw_sums: dict[str, float] = defaultdict(float)
+    pred_target_abs_sums: dict[str, float] = defaultdict(float)
+    pred_prediction_abs_sums: dict[str, float] = defaultdict(float)
     modulation_sums: dict[tuple[str, str], float] = defaultdict(float)
     modulation_counts: dict[tuple[str, str], int] = defaultdict(int)
     spike_weight = float(cfg.get("training", {}).get("spike_l1_weight", 0.0))
@@ -46,6 +82,13 @@ def run_epoch(
     t_train = cfg.get("training", {}).get("T_train")
     mixup_off_epoch = int(cfg.get("augmentation", {}).get("mixup_off_epoch", 0))
     mixup_enabled = mixup_fn is not None and (mixup_off_epoch <= 0 or epoch < mixup_off_epoch)
+    pred_loss_scale = prediction_loss_scale(epoch, cfg)
+    grad_ratio_every = int(cfg.get("training", {}).get("grad_ratio_every", cfg.get("predictive", {}).get("grad_ratio_every", 0)) or 0)
+    grad_params = _shared_grad_params(model) if grad_ratio_every > 0 else []
+    grad_norm_ce_sum = 0.0
+    grad_norm_pred_sum = 0.0
+    grad_ratio_sum = 0.0
+    grad_ratio_count = 0
 
     for batch_idx, (x, y) in enumerate(loader):
         x = x.to(device, non_blocking=True).float()
@@ -67,10 +110,18 @@ def run_epoch(
             logits = out["logits"]
             ce = classification_loss(logits, target_for_loss, label_smoothing=label_smoothing)
             aux = out.get("aux_loss", torch.tensor(0.0, device=device))
+            aux_for_loss = aux * pred_loss_scale
             spike_loss = torch.tensor(0.0, device=device)
             if spike_weight > 0:
                 spike_loss = spike_l1_regularizer(out.get("features", {}), spike_stages) * spike_weight
-            loss = ce + aux + spike_loss
+            loss = ce + aux_for_loss + spike_loss
+        if train and grad_ratio_every > 0 and grad_params and batch_idx % grad_ratio_every == 0 and aux_for_loss.requires_grad:
+            grad_norm_ce = _grad_norm(ce, grad_params)
+            grad_norm_pred = _grad_norm(aux_for_loss, grad_params)
+            grad_norm_ce_sum += grad_norm_ce
+            grad_norm_pred_sum += grad_norm_pred
+            grad_ratio_sum += grad_norm_pred / max(grad_norm_ce, 1e-12)
+            grad_ratio_count += 1
         if train:
             optimizer.zero_grad(set_to_none=True)
             if use_amp:
@@ -84,7 +135,7 @@ def run_epoch(
         total_n += bsz
         total_loss += loss.item() * bsz
         total_ce += ce.item() * bsz
-        total_aux += float(aux.item()) * bsz
+        total_aux += float(aux_for_loss.item()) * bsz
         total_acc += accuracy(logits.detach(), y, (1,))[0].item() * bsz
         for stage, err in out.get("prediction_normalized_errors", {}).items():
             pred_error_sums[stage] += float(err.item()) * bsz
@@ -92,6 +143,14 @@ def run_epoch(
         for stage, pred_loss in out.get("prediction_stage_losses", {}).items():
             pred_loss_sums[stage] += float(pred_loss.item()) * bsz
             pred_loss_counts[stage] += bsz
+        for stage, pred_loss in out.get("prediction_base_losses", {}).items():
+            pred_base_loss_sums[stage] += float(pred_loss.item()) * bsz
+        for stage, pred_loss in out.get("prediction_amplitude_losses", {}).items():
+            pred_amplitude_loss_sums[stage] += float(pred_loss.item()) * bsz
+        for stage, batch in out.get("prediction_batches", {}).items():
+            pred_raw_sums[stage] += float(batch.raw_error_mean.item()) * bsz
+            pred_target_abs_sums[stage] += float(batch.target_abs_mean.item()) * bsz
+            pred_prediction_abs_sums[stage] += float(batch.prediction_abs_mean.item()) * bsz
         for stage, stats in out.get("modulation_stats", {}).items():
             for name, value in stats.items():
                 key = (stage, name)
@@ -109,12 +168,26 @@ def run_epoch(
         "aux_loss": total_aux / max(1, total_n),
         "acc1": total_acc / max(1, total_n),
         "prediction_error_mean": pred_error_mean,
+        "prediction_loss_scale": pred_loss_scale,
         "num_samples": total_n,
     }
+    if grad_ratio_count > 0:
+        metrics["grad_norm_ce"] = grad_norm_ce_sum / grad_ratio_count
+        metrics["grad_norm_pred"] = grad_norm_pred_sum / grad_ratio_count
+        metrics["grad_ratio_pred_ce"] = grad_ratio_sum / grad_ratio_count
     for stage, val in pred_error_sums.items():
         metrics[f"prediction_error_{stage}"] = val / max(1, pred_error_counts[stage])
     for stage, val in pred_loss_sums.items():
         metrics[f"prediction_loss_{stage}"] = val / max(1, pred_loss_counts[stage])
+    for stage, val in pred_base_loss_sums.items():
+        metrics[f"prediction_base_loss_{stage}"] = val / max(1, pred_loss_counts[stage])
+    for stage, val in pred_amplitude_loss_sums.items():
+        metrics[f"prediction_amplitude_loss_{stage}"] = val / max(1, pred_loss_counts[stage])
+    for stage, val in pred_raw_sums.items():
+        metrics[f"prediction_raw_error_{stage}"] = val / max(1, pred_loss_counts[stage])
+        metrics[f"prediction_target_abs_{stage}"] = pred_target_abs_sums[stage] / max(1, pred_loss_counts[stage])
+        metrics[f"prediction_abs_{stage}"] = pred_prediction_abs_sums[stage] / max(1, pred_loss_counts[stage])
+        metrics[f"prediction_abs_ratio_{stage}"] = metrics[f"prediction_abs_{stage}"] / max(metrics[f"prediction_target_abs_{stage}"], 1e-12)
     for (stage, name), val in modulation_sums.items():
         metrics[f"modulation_{stage}_{name}"] = val / max(1, modulation_counts[(stage, name)])
     return metrics
@@ -150,6 +223,8 @@ def evaluate_detailed(
     pred_target_abs_sums: dict[str, float] = defaultdict(float)
     pred_prediction_abs_sums: dict[str, float] = defaultdict(float)
     pred_loss_sums: dict[str, float] = defaultdict(float)
+    pred_base_loss_sums: dict[str, float] = defaultdict(float)
+    pred_amplitude_loss_sums: dict[str, float] = defaultdict(float)
     pred_loss_counts: dict[str, int] = defaultdict(int)
     pred_timestep_sums: dict[tuple[str, int, str], float] = defaultdict(float)
     pred_timestep_counts: dict[tuple[str, int], int] = defaultdict(int)
@@ -196,6 +271,10 @@ def evaluate_detailed(
         for stage, pred_loss in out.get("prediction_stage_losses", {}).items():
             pred_loss_sums[stage] += float(pred_loss.item()) * bsz
             pred_loss_counts[stage] += bsz
+        for stage, pred_loss in out.get("prediction_base_losses", {}).items():
+            pred_base_loss_sums[stage] += float(pred_loss.item()) * bsz
+        for stage, pred_loss in out.get("prediction_amplitude_losses", {}).items():
+            pred_amplitude_loss_sums[stage] += float(pred_loss.item()) * bsz
         for stage, batch in out.get("prediction_batches", {}).items():
             pred_raw_sums[stage] += float(batch.raw_error_mean.item()) * bsz
             pred_target_abs_sums[stage] += float(batch.target_abs_mean.item()) * bsz
@@ -266,6 +345,10 @@ def evaluate_detailed(
         summary[f"prediction_error_{stage}"] = val / max(1, pred_error_counts[stage])
     for stage, val in pred_loss_sums.items():
         summary[f"prediction_loss_{stage}"] = val / max(1, pred_loss_counts[stage])
+    for stage, val in pred_base_loss_sums.items():
+        summary[f"prediction_base_loss_{stage}"] = val / max(1, pred_loss_counts[stage])
+    for stage, val in pred_amplitude_loss_sums.items():
+        summary[f"prediction_amplitude_loss_{stage}"] = val / max(1, pred_loss_counts[stage])
     for (stage, name), val in modulation_sums.items():
         summary[f"modulation_{stage}_{name}"] = val / max(1, modulation_counts[(stage, name)])
     rows: list[dict[str, Any]] = []
@@ -300,7 +383,10 @@ def evaluate_detailed(
             "raw_error_mean": pred_raw_sums[stage] / max(1, pred_error_counts[stage]),
             "target_abs_mean": pred_target_abs_sums[stage] / max(1, pred_error_counts[stage]),
             "prediction_abs_mean": pred_prediction_abs_sums[stage] / max(1, pred_error_counts[stage]),
+            "prediction_abs_ratio": pred_prediction_abs_sums[stage] / max(pred_target_abs_sums[stage], 1e-12),
             "loss": pred_loss_sums[stage] / max(1, pred_loss_counts[stage]),
+            "base_loss": pred_base_loss_sums[stage] / max(1, pred_loss_counts[stage]),
+            "amplitude_loss": pred_amplitude_loss_sums[stage] / max(1, pred_loss_counts[stage]),
         }
         for stage, val in sorted(pred_error_sums.items())
     ]

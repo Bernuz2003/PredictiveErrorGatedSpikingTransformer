@@ -22,25 +22,24 @@ dataset:
 predictive:
   enabled: true
   stage: stage1
-  stages: [stage1, stage2]
+  stages: [stage1]
   history: 2
   predictor_type: depthwise_conv
   loss_type: smooth_l1
   loss_weight: 0.05
-  warmup_epochs: 20
-  ramp_epochs: 20
+  warmup_epochs: 0
+  ramp_epochs: 0
   normalize_loss: true
   amplitude_loss_weight: 0.05
   loss_reduction: mean
   stage_loss_weights:
     stage1: 1.0
-    stage2: 1.0
   target: latent
   stop_gradient_target: true
 modulation:
-  enabled: true
+  enabled: false
   stage: stage1
-  stages: [stage1, stage2]
+  stages: [stage1]
   mode: membrane_gain
   alpha: 0.1
 early_exit:
@@ -64,9 +63,9 @@ augmentation:
   random_horizontal_flip: true
   horizontal_flip_prob: 0.5
   snn_augment_wide: true
-  mixup: 0.5
-  mixup_prob: 0.5
-  mixup_off_epoch: 75
+  mixup: 0.0
+  mixup_prob: 0.0
+  mixup_off_epoch: 0
 loss:
   train: soft_target_cross_entropy
   eval: cross_entropy
@@ -76,7 +75,10 @@ training:
   label_smoothing: 0.1
   spike_l1_weight: 0.0
   T_train: null
-  grad_ratio_every: 20
+  init_checkpoint: /path/to/baseline_T8/checkpoint_best.pt
+  init_strict: false
+  train_predictors_only: true
+  grad_ratio_every: 0
 optimizer:
   type: adamw
   lr: 0.001

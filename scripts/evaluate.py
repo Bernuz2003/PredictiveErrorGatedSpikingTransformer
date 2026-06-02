@@ -61,7 +61,10 @@ def main() -> None:
             "raw_error_mean",
             "target_abs_mean",
             "prediction_abs_mean",
+            "prediction_abs_ratio",
             "loss",
+            "base_loss",
+            "amplitude_loss",
         ],
     )
     write_csv(
