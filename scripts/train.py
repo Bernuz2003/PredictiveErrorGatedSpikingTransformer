@@ -10,7 +10,9 @@ from pegst.data.dvs import build_dataloader
 from pegst.models.predictive_qkformer import build_predictive_qkformer
 from pegst.models.snn_layers import reset_spiking_state
 from pegst.profiling.activity_profiler import ActivityProfiler, save_parameter_summary
+from pegst.training.augment import build_batch_augment, build_mixup
 from pegst.training.engine import evaluate_detailed, run_epoch
+from pegst.training.scheduler import build_scheduler
 from pegst.utils.config import load_config, save_config
 from pegst.utils.io import append_csv, write_json, write_csv
 from pegst.utils.seed import seed_everything
@@ -74,19 +76,38 @@ def main() -> None:
     device = torch.device(cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
 
     model = build_predictive_qkformer(cfg).to(device)
+    resume_ckpt = None
     if args.resume:
-        ckpt = torch.load(args.resume, map_location="cpu")
-        model.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt)
+        resume_ckpt = torch.load(args.resume, map_location="cpu")
+        model.load_state_dict(resume_ckpt["model"] if "model" in resume_ckpt else resume_ckpt)
     save_parameter_summary(model, out_dir)
     train_loader = build_dataloader(cfg["dataset"], "train")
     val_loader = build_dataloader(cfg["dataset"], "test")
     opt_cfg = cfg.get("optimizer", {})
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=float(opt_cfg.get("lr", 5e-4)),
-        weight_decay=float(opt_cfg.get("weight_decay", 0.05)),
-    )
+    opt_type = opt_cfg.get("type", opt_cfg.get("opt", "adamw"))
+    if opt_type == "sgd":
+        optimizer = torch.optim.SGD(
+            model.parameters(),
+            lr=float(opt_cfg.get("lr", 1e-3)),
+            momentum=float(opt_cfg.get("momentum", 0.9)),
+            weight_decay=float(opt_cfg.get("weight_decay", 0.06)),
+        )
+    else:
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=float(opt_cfg.get("lr", 1e-3)),
+            weight_decay=float(opt_cfg.get("weight_decay", 0.06)),
+            eps=float(opt_cfg.get("eps", 1e-8)),
+        )
     epochs = int(cfg.get("training", {}).get("epochs", 1))
+    scheduler = build_scheduler(optimizer, cfg, epochs)
+    start_epoch = 0
+    if resume_ckpt is not None and isinstance(resume_ckpt, dict):
+        if "optimizer" in resume_ckpt:
+            optimizer.load_state_dict(resume_ckpt["optimizer"])
+        if scheduler is not None and resume_ckpt.get("scheduler") is not None:
+            scheduler.load_state_dict(resume_ckpt["scheduler"])
+        start_epoch = int(resume_ckpt.get("epoch", -1)) + 1
     best_acc = -1.0
     metric_fields = [
         "epoch",
@@ -96,6 +117,7 @@ def main() -> None:
         "aux_loss",
         "acc1",
         "prediction_error_mean",
+        "lr",
         "num_samples",
         "val_loss",
         "val_ce_loss",
@@ -108,8 +130,23 @@ def main() -> None:
     all_prediction_rows: list[dict[str, float | int | str]] = []
     all_prediction_timestep_rows: list[dict[str, float | int | str]] = []
     all_modulation_rows: list[dict[str, float | int | str]] = []
-    for epoch in range(epochs):
-        train_metrics = run_epoch(model, train_loader, optimizer, device, epoch, cfg, out_dir)
+    batch_augment = build_batch_augment(cfg)
+    mixup_fn = build_mixup(cfg)
+    for epoch in range(start_epoch, epochs):
+        if scheduler is not None:
+            scheduler.step(epoch)
+        train_metrics = run_epoch(
+            model,
+            train_loader,
+            optimizer,
+            device,
+            epoch,
+            cfg,
+            out_dir,
+            batch_augment=batch_augment,
+            mixup_fn=mixup_fn,
+        )
+        train_metrics["lr"] = optimizer.param_groups[0]["lr"]
         (
             val_summary,
             timestep_rows,
@@ -181,7 +218,14 @@ def main() -> None:
             all_modulation_rows,
             fieldnames=["epoch", "split", "stage", "stat", "value"],
         )
-        state = {"model": model.state_dict(), "config": cfg, "epoch": epoch, "val_acc1": val_summary["acc1"]}
+        state = {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict() if scheduler is not None else None,
+            "config": cfg,
+            "epoch": epoch,
+            "val_acc1": val_summary["acc1"],
+        }
         torch.save(state, out_dir / "checkpoint_last.pt")
         if val_summary["acc1"] > best_acc:
             best_acc = val_summary["acc1"]

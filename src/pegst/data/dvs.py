@@ -83,11 +83,12 @@ def build_dataset(cfg: dict[str, Any], split: str) -> Dataset:
 
 def build_dataloader(cfg: dict[str, Any], split: str) -> DataLoader:
     ds = build_dataset(cfg, split)
+    drop_last_train = bool(cfg.get("drop_last_train", cfg.get("drop_last", False)))
     return DataLoader(
         ds,
         batch_size=int(cfg.get("batch_size", 16)),
         shuffle=(split == "train"),
         num_workers=int(cfg.get("workers", 4)),
         pin_memory=bool(cfg.get("pin_memory", True)),
-        drop_last=bool(cfg.get("drop_last", False) and split == "train"),
+        drop_last=bool(drop_last_train and split == "train"),
     )

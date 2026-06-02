@@ -9,6 +9,7 @@ from torch import nn
 from torch.cuda import amp
 
 from pegst.models.snn_layers import reset_spiking_state
+from pegst.training.augment import maybe_one_hot_for_soft_target
 from pegst.training.losses import classification_loss, spike_l1_regularizer
 from pegst.training.metrics import accuracy, confidence_entropy, timestep_accuracy
 
@@ -21,6 +22,8 @@ def run_epoch(
     epoch: int,
     cfg: dict[str, Any],
     out_dir: str | Path | None = None,
+    batch_augment=None,
+    mixup_fn=None,
 ) -> dict[str, float]:
     train = optimizer is not None
     model.train(train)
@@ -40,15 +43,29 @@ def run_epoch(
     label_smoothing = float(cfg.get("training", {}).get("label_smoothing", 0.0))
     use_amp = bool(cfg.get("training", {}).get("amp", False) and device.type == "cuda")
     scaler = amp.GradScaler(enabled=use_amp)
+    t_train = cfg.get("training", {}).get("T_train")
+    mixup_off_epoch = int(cfg.get("augmentation", {}).get("mixup_off_epoch", 0))
+    mixup_enabled = mixup_fn is not None and (mixup_off_epoch <= 0 or epoch < mixup_off_epoch)
 
     for batch_idx, (x, y) in enumerate(loader):
         x = x.to(device, non_blocking=True).float()
         y = y.to(device, non_blocking=True).long()
+        target_for_loss: torch.Tensor = y
+        if train and batch_augment is not None:
+            x = batch_augment(x)
+        if train and mixup_enabled:
+            x, target_for_loss = mixup_fn(x, y)
+        elif train:
+            target_for_loss = maybe_one_hot_for_soft_target(cfg, y)
+        if train and t_train:
+            sec_list = torch.randperm(x.shape[1], device=x.device)[: int(t_train)]
+            sec_list = torch.sort(sec_list).values
+            x = x[:, sec_list]
         reset_spiking_state(model)
         with torch.set_grad_enabled(train), amp.autocast(enabled=use_amp):
             out = model(x, return_aux=True, return_features=(spike_weight > 0), return_timestep_logits=True)
             logits = out["logits"]
-            ce = classification_loss(logits, y, label_smoothing=label_smoothing)
+            ce = classification_loss(logits, target_for_loss, label_smoothing=label_smoothing)
             aux = out.get("aux_loss", torch.tensor(0.0, device=device))
             spike_loss = torch.tensor(0.0, device=device)
             if spike_weight > 0:
@@ -156,7 +173,7 @@ def evaluate_detailed(
         logits = out["logits"]
         ce = classification_loss(logits, y)
         aux = out.get("aux_loss", torch.tensor(0.0, device=device))
-        loss = ce + aux
+        loss = ce + aux if cfg.get("loss", {}).get("eval", "cross_entropy") != "cross_entropy" else ce
         bsz = y.numel()
         total_n += bsz
         total_loss += loss.item() * bsz
