@@ -16,6 +16,7 @@ from pegst.probing.targets import collect_targets_from_batch, predictor_tensor, 
 from pegst.utils.checkpoint import load_model_checkpoint
 from pegst.utils.config import load_config
 from pegst.utils.io import write_csv, write_json
+from pegst.utils.progress import Timer, log, should_log
 from pegst.utils.seed import seed_everything
 
 
@@ -27,6 +28,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-dir", required=True)
     p.add_argument("--split", default="test", choices=["train", "test"])
     p.add_argument("--batches", type=int, default=0)
+    p.add_argument("--log-every", type=int, default=10)
     return p.parse_args()
 
 
@@ -79,16 +81,36 @@ def build_predictor_from_checkpoint(path: str | Path, device: torch.device) -> t
 @torch.no_grad()
 def main() -> None:
     args = parse_args()
+    timer = Timer()
+    log("M3 usefulness probe started")
+    log(f"config={args.config}")
+    log(f"checkpoint={args.checkpoint}")
+    log(f"predictor_checkpoint={args.predictor_checkpoint}")
+    log(f"output_dir={args.output_dir}")
     cfg = load_config(args.config)
     seed_everything(int(cfg.get("seed", 2021)))
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
     model = build_qkformer(cfg.get("model", {})).to(device)
+    log("loading baseline checkpoint")
     load_info = load_model_checkpoint(model, args.checkpoint, strict=False)
+    log(
+        "baseline loaded: "
+        f"missing={len(load_info.get('missing_keys', []))}, "
+        f"unexpected={len(load_info.get('unexpected_keys', []))}"
+    )
     model.eval()
+    log("loading M2 predictor checkpoint")
     predictor, pred_ckpt = build_predictor_from_checkpoint(args.predictor_checkpoint, device)
     candidate = pred_ckpt["candidate"]
+    log(
+        "predictor ready: "
+        f"target={candidate['target']}, stage={candidate['stage']}, layer={candidate['layer']}, "
+        f"history={pred_ckpt['history']}, predictor={pred_ckpt['predictor_type']}, "
+        f"amp={pred_ckpt.get('amplitude_loss_weight', 0.0)}"
+    )
+    log(f"building dataloader split={args.split}, batches={'all' if args.batches <= 0 else args.batches}")
     loader = build_dataloader(cfg["dataset"], args.split)
 
     sample_rows: list[dict[str, Any]] = []
@@ -96,6 +118,7 @@ def main() -> None:
     for batch_idx, (x, y) in enumerate(loader):
         if args.batches > 0 and batch_idx >= args.batches:
             break
+        batch_no = batch_idx + 1
         x = x.to(device).float()
         y = y.to(device).long()
         reset_spiking_state(model)
@@ -150,7 +173,10 @@ def main() -> None:
                 }
             )
             sample_id += 1
+        if should_log(batch_no, args.batches if args.batches > 0 else None, args.log_every):
+            log(f"M3 split={args.split}: processed batch {batch_no}, samples={len(sample_rows)}, elapsed={timer.elapsed_str()}")
 
+    log(f"M3 collected {len(sample_rows)} samples; computing usefulness metrics")
     errors = [float(r["prediction_error"]) for r in sample_rows]
     raw_errors = [float(r["raw_prediction_error"]) for r in sample_rows]
     confidence = [float(r["confidence"]) for r in sample_rows]
@@ -211,7 +237,15 @@ def main() -> None:
             },
         },
     )
-    print(summary)
+    log(
+        "M3 summary: "
+        f"accuracy={summary['overall_accuracy']:.4f}, "
+        f"auc_error_incorrect={summary['auc_error_detects_incorrect']:.4f}, "
+        f"corr_error_entropy={summary['corr_error_entropy']:.4f}, "
+        f"corr_error_confidence={summary['corr_error_confidence']:.4f}, "
+        f"passes_m3={summary['passes_m3']}"
+    )
+    log(f"M3 finished in {timer.elapsed_str()} -> {out_dir}")
 
 
 if __name__ == "__main__":

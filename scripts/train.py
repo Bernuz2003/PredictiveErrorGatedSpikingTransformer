@@ -16,6 +16,7 @@ from pegst.training.scheduler import build_scheduler
 from pegst.utils.checkpoint import load_model_checkpoint
 from pegst.utils.config import load_config, save_config
 from pegst.utils.io import append_csv, write_json, write_csv
+from pegst.utils.progress import Timer, log
 from pegst.utils.seed import seed_everything
 
 
@@ -48,6 +49,10 @@ def configure_trainable_parameters(model, cfg: dict) -> list[torch.nn.Parameter]
 
 def main() -> None:
     args = parse_args()
+    timer = Timer()
+    log("baseline training started")
+    log(f"config={args.config}")
+    log(f"output_dir={args.output_dir}")
     cfg = load_config(args.config)
     out_dir = Path(args.output_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -58,15 +63,20 @@ def main() -> None:
     model = build_qkformer(cfg.get("model", {})).to(device)
     resume_ckpt = None
     if args.resume:
+        log(f"resuming from checkpoint={args.resume}")
         resume_ckpt = torch.load(args.resume, map_location="cpu")
         load_model_checkpoint(model, args.resume, strict=True)
     else:
         init_checkpoint = args.init_checkpoint or cfg.get("training", {}).get("init_checkpoint", "")
         if init_checkpoint:
+            log(f"loading init checkpoint={init_checkpoint}")
             load_model_checkpoint(model, init_checkpoint, strict=bool(cfg.get("training", {}).get("init_strict", False)))
+    log(f"model ready on device={device}")
 
     trainable_params = configure_trainable_parameters(model, cfg)
+    log(f"trainable parameters: {sum(p.numel() for p in trainable_params):,}")
     save_parameter_summary(model, out_dir)
+    log("building train/test dataloaders")
     train_loader = build_dataloader(cfg["dataset"], "train")
     val_loader = build_dataloader(cfg["dataset"], "test")
     opt_cfg = cfg.get("optimizer", {})
@@ -110,6 +120,8 @@ def main() -> None:
     batch_augment = build_batch_augment(cfg)
     mixup_fn = build_mixup(cfg)
     for epoch in range(start_epoch, epochs):
+        epoch_timer = Timer()
+        log(f"epoch {epoch + 1}/{epochs} started")
         if scheduler is not None:
             scheduler.step(epoch)
         train_metrics = run_epoch(
@@ -155,12 +167,18 @@ def main() -> None:
             write_json(out_dir / "metrics_best.json", row)
             write_csv(out_dir / "timestep_metrics_best.csv", timestep_rows)
             write_csv(out_dir / "confusion_matrix_best.csv", confusion_rows)
-        print(f"epoch={epoch} train_acc={train_metrics['acc1']:.2f} val_acc={val_summary['acc1']:.2f}")
+            log(f"new best checkpoint saved: val_acc={best_acc:.2f}")
+        log(
+            f"epoch {epoch + 1}/{epochs} done in {epoch_timer.elapsed_str()}: "
+            f"train_acc={train_metrics['acc1']:.2f}, val_acc={val_summary['acc1']:.2f}, "
+            f"lr={optimizer.param_groups[0]['lr']:.6g}"
+        )
 
     profile_batches = args.profile_batches
     if profile_batches <= 0 and cfg.get("profiling", {}).get("enabled", False):
         profile_batches = int(cfg.get("profiling", {}).get("profile_batches", 0))
     if profile_batches > 0:
+        log(f"activity profiling started: batches={profile_batches}")
         profiler = ActivityProfiler(model)
         profiler.attach()
         model.eval()
@@ -174,6 +192,8 @@ def main() -> None:
         summary = profiler.save(out_dir)
         profiler.close()
         write_json(out_dir / "profile_summary.json", summary)
+        log("activity profiling completed")
+    log(f"baseline training finished in {timer.elapsed_str()} -> {out_dir}")
 
 
 if __name__ == "__main__":

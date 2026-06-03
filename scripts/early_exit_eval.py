@@ -12,27 +12,38 @@ from pegst.models.snn_layers import reset_spiking_state
 from pegst.utils.checkpoint import load_model_checkpoint
 from pegst.utils.config import load_config
 from pegst.utils.io import write_csv, write_json
+from pegst.utils.progress import Timer, log
 
 
 @torch.no_grad()
 def main() -> None:
+    timer = Timer()
     p = argparse.ArgumentParser(description="Evaluate confidence-based early exit over QKFormer timestep logits.")
     p.add_argument("--config", required=True)
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--output-dir", required=True)
     p.add_argument("--confidence-thresholds", nargs="+", type=float, default=None)
     args = p.parse_args()
+    log("early-exit evaluation started")
+    log(f"config={args.config}")
+    log(f"checkpoint={args.checkpoint}")
+    log(f"output_dir={args.output_dir}")
     cfg = load_config(args.config)
     early_cfg = cfg.get("early_exit", {})
     confidence_thresholds = args.confidence_thresholds or early_cfg.get("confidence_thresholds", [0.7, 0.8, 0.9, 0.95])
     device = torch.device(cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
     model = build_qkformer(cfg.get("model", {})).to(device)
+    log("loading checkpoint")
     load_info = load_model_checkpoint(model, args.checkpoint, strict=bool(cfg.get("eval_strict", False)))
     model.eval()
+    log(f"checkpoint loaded; thresholds={confidence_thresholds}")
+    log("building test dataloader")
     loader = build_dataloader(cfg["dataset"], "test")
     rows = []
     distribution_rows = []
     for tau in confidence_thresholds:
+        tau_timer = Timer()
+        log(f"threshold tau={tau}: evaluation started")
         correct = 0
         total = 0
         exit_sum = 0.0
@@ -71,6 +82,11 @@ def main() -> None:
             "expected_sops_fraction": avg_exit / max(1, len(dist_counts or [])),
         }
         rows.append(row)
+        log(
+            f"threshold tau={tau}: accuracy={row['accuracy']:.2f}, "
+            f"avg_exit={row['avg_exit_timestep']:.2f}, coverage={row['coverage']:.3f}, "
+            f"elapsed={tau_timer.elapsed_str()}"
+        )
         for t, count in enumerate(dist_counts or []):
             distribution_rows.append(
                 {
@@ -85,7 +101,7 @@ def main() -> None:
     write_csv(out_dir / "early_exit_summary.csv", rows)
     write_csv(out_dir / "accuracy_vs_exit_threshold.csv", rows)
     write_csv(out_dir / "exit_timestep_distribution.csv", distribution_rows)
-    print(rows)
+    log(f"early-exit evaluation finished in {timer.elapsed_str()} -> {out_dir}")
 
 
 if __name__ == "__main__":

@@ -26,6 +26,7 @@ from pegst.probing.targets import collect_targets_from_batch, predictor_tensor, 
 from pegst.utils.checkpoint import load_model_checkpoint
 from pegst.utils.config import load_config
 from pegst.utils.io import write_csv, write_json
+from pegst.utils.progress import Timer, log, should_log
 from pegst.utils.seed import seed_everything
 
 
@@ -60,6 +61,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--loss-type", default="smooth_l1", choices=["l1", "mse", "smooth_l1", "normalized_l1", "normalized_mse", "normalized_smooth_l1"])
     p.add_argument("--normalize-loss", action="store_true")
     p.add_argument("--soft-firing-temperature", type=float, default=0.25)
+    p.add_argument("--log-every", type=int, default=50)
     return p.parse_args()
 
 
@@ -365,37 +367,90 @@ def build_decision_rows(rows: list[dict[str, Any]], baselines: list[str], eval_m
 
 def main() -> None:
     args = parse_args()
+    timer = Timer()
+    log("M2 membrane predictability probe started")
+    log(f"config={args.config}")
+    log(f"checkpoint={args.checkpoint}")
+    log(f"output_dir={args.output_dir}")
+    log(
+        "settings: "
+        f"targets={args.targets}, stages={args.stages}, audit_csv={args.audit_csv or 'none'}, "
+        f"require_m1={args.require_passes_m1}, audit_split={args.audit_split}, "
+        f"histories={args.histories}, predictor_types={args.predictor_types}, "
+        f"amp_weights={args.amplitude_loss_weights}, steps={args.steps}, eval_splits={args.eval_splits}, modes={args.modes}"
+    )
     cfg = load_config(args.config)
     seed_everything(int(cfg.get("seed", 2021)))
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
     model = build_qkformer(cfg.get("model", {})).to(device)
+    log("loading baseline checkpoint")
     load_info = load_model_checkpoint(model, args.checkpoint, strict=False)
+    log(
+        "checkpoint loaded: "
+        f"missing={len(load_info.get('missing_keys', []))}, "
+        f"unexpected={len(load_info.get('unexpected_keys', []))}"
+    )
     for param in model.parameters():
         param.requires_grad_(False)
     model.eval()
+    log(f"model frozen and ready on device={device}")
 
+    log("building train/eval dataloaders")
     train_loader = build_dataloader(cfg["dataset"], "train")
     eval_loaders = {split: build_dataloader(cfg["dataset"], split) for split in args.eval_splits}
     allowed = audit_candidates(args.audit_csv, args.require_passes_m1, args.audit_split)
+    if args.audit_csv:
+        log(f"M1 allowed candidates after audit filtering: {len(allowed)}")
     candidates = discover_candidates(model, train_loader, device, args, allowed)
     if not candidates:
         raise RuntimeError("No target candidates discovered. Check --targets, --stages, --layer-patterns, or --audit-csv.")
+    log(f"discovered M2 candidates: {len(candidates)}")
+    for idx, candidate in enumerate(candidates[:10], start=1):
+        log(
+            f"candidate {idx}/{len(candidates)}: "
+            f"{candidate['target']} | {candidate['stage']} | {candidate['layer']} | "
+            f"shape={candidate['shape']} | spatial={candidate['spatial']}"
+        )
+    if len(candidates) > 10:
+        log(f"... {len(candidates) - 10} additional candidates not printed")
 
     rows: list[dict[str, Any]] = []
     curve_rows: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     predictor_dir = out_dir / "predictors"
     predictor_dir.mkdir(exist_ok=True)
+    total_configs = 0
+    for _candidate in candidates:
+        for history in args.histories:
+            for predictor_type in args.predictor_types:
+                if predictor_type == "motion_extrapolation" and history < 2:
+                    continue
+                total_configs += len(args.amplitude_loss_weights)
+    log(f"M2 train/eval configurations to run: {total_configs}")
 
+    config_idx = 0
     for candidate in candidates:
+        log(f"candidate start: {candidate['target']} | {candidate['stage']} | {candidate['layer']}")
         for history in args.histories:
             for predictor_type in args.predictor_types:
                 if predictor_type == "motion_extrapolation" and history < 2:
                     skipped.append({**candidate, "history": history, "predictor_type": predictor_type, "reason": "requires_history_ge_2"})
+                    log(
+                        f"skip candidate={candidate['target']} stage={candidate['stage']} layer={candidate['layer']} "
+                        f"history={history} predictor={predictor_type}: requires history >= 2",
+                        tag="SKIP",
+                    )
                     continue
                 for amplitude_loss_weight in args.amplitude_loss_weights:
+                    config_idx += 1
+                    cfg_timer = Timer()
+                    log(
+                        f"M2 config {config_idx}/{total_configs} training: "
+                        f"target={candidate['target']}, stage={candidate['stage']}, layer={candidate['layer']}, "
+                        f"history={history}, predictor={predictor_type}, amp={amplitude_loss_weight}"
+                    )
                     predictor = FutureStatePredictor(
                         candidate["channels"],
                         history=history,
@@ -441,7 +496,17 @@ def main() -> None:
                         torch.nn.utils.clip_grad_norm_(predictor.parameters(), max_norm=5.0)
                         opt.step()
                         last_loss = float(batch.loss.item())
+                        if should_log(step_idx, args.steps, args.log_every):
+                            log(
+                                f"M2 config {config_idx}/{total_configs}: "
+                                f"step {step_idx}/{args.steps}, train_loss={last_loss:.6f}, elapsed={cfg_timer.elapsed_str()}"
+                            )
                         if step_idx in eval_points:
+                            log(
+                                f"M2 config {config_idx}/{total_configs}: "
+                                f"curve eval at step {step_idx}/{args.steps} on "
+                                f"{'test' if 'test' in eval_loaders else 'train'} ({args.curve_batches} batches)"
+                            )
                             curve_metrics, _ = evaluate_predictor(
                                 model,
                                 predictor,
@@ -469,6 +534,7 @@ def main() -> None:
                                 }
                             )
 
+                    log(f"M2 config {config_idx}/{total_configs}: final evaluation started")
                     for eval_split, loader in eval_loaders.items():
                         for eval_mode in args.modes:
                             learned_metrics, baseline_metrics = evaluate_predictor(
@@ -497,7 +563,13 @@ def main() -> None:
                                     metrics=learned_metrics,
                                 )
                             )
-                            print(rows[-1])
+                            log(
+                                f"M2 eval config {config_idx}/{total_configs}: "
+                                f"split={eval_split}, mode={eval_mode}, "
+                                f"learned_norm={learned_metrics.get('normalized_error', float('nan')):.4f}, "
+                                f"raw={learned_metrics.get('raw_error_mean', float('nan')):.4f}, "
+                                f"amp_ratio={learned_metrics.get('prediction_abs_ratio', float('nan')):.3f}"
+                            )
                             for baseline, metrics in baseline_metrics.items():
                                 rows.append(
                                     row_from_metrics(
@@ -514,7 +586,6 @@ def main() -> None:
                                         metrics=metrics,
                                     )
                                 )
-                                print(rows[-1])
 
                     safe_name = (
                         f"{candidate['target']}__{candidate['stage']}__"
@@ -534,7 +605,12 @@ def main() -> None:
                         },
                         predictor_dir / safe_name,
                     )
+                    log(
+                        f"M2 config {config_idx}/{total_configs} completed in {cfg_timer.elapsed_str()} "
+                        f"-> predictors/{safe_name}"
+                    )
 
+    log("M2 building decision metrics and writing outputs")
     decision_rows = build_decision_rows(rows, args.baselines, args.modes)
     write_csv(out_dir / "prediction_error.csv", rows)
     write_csv(out_dir / "probe_learning_curve.csv", curve_rows)
@@ -572,6 +648,13 @@ def main() -> None:
             },
         },
     )
+    strict_passes = sum(1 for row in decision_rows if row.get("passes_strict_probe"))
+    log(
+        "M2 outputs written: "
+        f"prediction_rows={len(rows)}, curve_rows={len(curve_rows)}, decision_rows={len(decision_rows)}, "
+        f"strict_passes={strict_passes}, skipped={len(skipped)}"
+    )
+    log(f"M2 finished in {timer.elapsed_str()} -> {out_dir}")
 
 
 if __name__ == "__main__":

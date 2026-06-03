@@ -26,6 +26,7 @@ from pegst.profiling.internal_state_collector import StreamingStats, write_recor
 from pegst.utils.checkpoint import load_model_checkpoint
 from pegst.utils.config import load_config
 from pegst.utils.io import write_csv, write_json
+from pegst.utils.progress import Timer, log, should_log
 from pegst.utils.seed import seed_everything
 
 
@@ -60,6 +61,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--reverse-sanity-min", type=float, default=0.95)
     p.add_argument("--reverse-sanity-max", type=float, default=1.05)
     p.add_argument("--near-zero-max", type=float, default=0.95)
+    p.add_argument("--log-every", type=int, default=4)
     return p.parse_args()
 
 
@@ -166,6 +168,16 @@ def build_decision_rows(
 
 def main() -> None:
     args = parse_args()
+    timer = Timer()
+    log("M1 target audit started")
+    log(f"config={args.config}")
+    log(f"checkpoint={args.checkpoint or 'none'}")
+    log(f"output_dir={args.output_dir}")
+    log(
+        "settings: "
+        f"splits={args.splits}, stages={args.stages}, targets={args.targets}, "
+        f"modes={args.modes}, baselines={args.baselines}, batches_per_split={args.batches}"
+    )
     cfg = load_config(args.config)
     seed_everything(int(cfg.get("seed", 2021)))
     out_dir = Path(args.output_dir)
@@ -174,8 +186,15 @@ def main() -> None:
     model = build_qkformer(cfg.get("model", {})).to(device)
     load_info = {}
     if args.checkpoint:
+        log("loading baseline checkpoint")
         load_info = load_model_checkpoint(model, args.checkpoint, strict=False)
+        log(
+            "checkpoint loaded: "
+            f"missing={len(load_info.get('missing_keys', []))}, "
+            f"unexpected={len(load_info.get('unexpected_keys', []))}"
+        )
     model.eval()
+    log(f"model ready on device={device}")
 
     baseline_accs: dict[tuple[str, str, str, str, str, str], dict[str, float]] = defaultdict(dict)
     distribution_accs: dict[tuple[str, str, str, str], dict[str, float]] = defaultdict(dict)
@@ -193,10 +212,15 @@ def main() -> None:
     }
 
     for split in args.splits:
+        split_timer = Timer()
+        log(f"M1 split={split}: building dataloader")
         loader = build_dataloader(cfg["dataset"], split)
+        log(f"M1 split={split}: scanning up to {args.batches} batches")
+        processed = 0
         for batch_idx, (x, _) in enumerate(loader):
             if batch_idx >= args.batches:
                 break
+            processed = batch_idx + 1
             x = x.to(device).float()
             reset_spiking_state(model)
             with torch.no_grad():
@@ -207,6 +231,12 @@ def main() -> None:
                     stages=args.stages,
                     layer_patterns=args.layer_patterns,
                     soft_firing_temperature=args.soft_firing_temperature,
+                )
+            if should_log(processed, args.batches, args.log_every):
+                layers_seen = len({item.layer for item in target_items})
+                log(
+                    f"M1 split={split}: batch {processed}/{args.batches}, "
+                    f"targets_collected={len(target_items)}, layers={layers_seen}, elapsed={split_timer.elapsed_str()}"
                 )
             profile["batches"] += 1
             profile["forwards"] += rec_profile.forwards
@@ -244,7 +274,9 @@ def main() -> None:
                         metrics = prediction_metrics(pred, target, loss_type="l1")
                         key = (item.target, item.stage, item.layer, split, mode, baseline)
                         add_weighted(baseline_accs[key], metrics, target.shape[1])
+        log(f"M1 split={split}: completed {processed} batches in {split_timer.elapsed_str()}")
 
+    log("M1 aggregating baseline, distribution and autocorrelation metrics")
     baseline_rows = []
     for (target, stage, layer, split, mode, baseline), acc in sorted(baseline_accs.items()):
         row = {
@@ -313,7 +345,14 @@ def main() -> None:
             "no_nan": "finite_fraction == 1.0",
         },
     )
-    print({"output_dir": str(out_dir), "summary_rows": len(summary), "by_layer_rows": len(decision_by_split)})
+    promoted_layer = sum(1 for row in decision_by_split if row.get("passes_m1"))
+    promoted_stage = sum(1 for row in by_stage if row.get("passes_m1"))
+    log(
+        "M1 outputs written: "
+        f"summary_rows={len(summary)}, by_stage_rows={len(by_stage)}, by_layer_rows={len(decision_by_split)}, "
+        f"promoted_layers={promoted_layer}, promoted_stage_groups={promoted_stage}"
+    )
+    log(f"M1 finished in {timer.elapsed_str()} -> {out_dir}")
 
 
 if __name__ == "__main__":
