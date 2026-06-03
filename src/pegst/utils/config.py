@@ -21,11 +21,11 @@ def normalize_config(cfg: dict[str, Any]) -> dict[str, Any]:
         cfg.setdefault("dataset", {})
         cfg["model"].setdefault("T", cfg["timesteps"])
         cfg["dataset"].setdefault("T", cfg["timesteps"])
-    for section in ("predictive", "modulation"):
-        if isinstance(cfg.get(section), dict):
-            block = cfg[section]
-            if "stage" in block and "stages" not in block:
-                block["stages"] = [block["stage"]]
+    cfg.setdefault("record_internal_states", False)
+    cfg.setdefault(
+        "record_targets",
+        ["input_current", "pre_membrane", "post_reset_membrane", "spike", "threshold_margin", "soft_firing_prob"],
+    )
     return cfg
 
 

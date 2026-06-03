@@ -242,7 +242,7 @@ class QKFormerNet(nn.Module):
 
     The implementation is based on the uploaded QKFormer pipeline, but removes
     timm registration and exposes stage activations, timestep logits, and feature
-    callbacks required by the predictive experiments.
+    callbacks required by membrane-aware audits and causal probes.
     """
 
     def __init__(self, cfg: QKFormerConfig) -> None:

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pegst"
 version = "0.1.0"
-description = "Predictive Error-Gated Spiking Transformer for event-based vision"
+description = "Membrane-aware predictive probing for QKFormer on event-based vision"
 requires-python = ">=3.10"
 dependencies = [
   "torch>=1.12",

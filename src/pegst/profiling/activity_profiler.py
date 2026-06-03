@@ -85,12 +85,6 @@ def spike_stats(x: torch.Tensor) -> tuple[float, float]:
 
 def stage_from_name(name: str) -> str:
     local = name.replace("backbone.", "")
-    if local.startswith("predictors."):
-        parts = local.split(".")
-        return f"predictive_{parts[1]}" if len(parts) > 1 else "predictive"
-    if local.startswith("modulators."):
-        parts = local.split(".")
-        return f"modulation_{parts[1]}" if len(parts) > 1 else "modulation"
     if local.startswith("patch_embed1"):
         return "backbone_patch_embed1"
     if local.startswith("stage1"):

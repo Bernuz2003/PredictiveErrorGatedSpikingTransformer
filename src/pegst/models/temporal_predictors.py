@@ -31,10 +31,11 @@ class PredictionBatch:
 
 
 class FutureStatePredictor(nn.Module):
-    """Causal predictor for future latent SNN states.
+    """Causal predictor for future internal SNN targets.
 
-    Supports both spatial features [T, B, C, H, W] and pooled features [T, B, C].
-    History is implemented by channel concatenation of the last k states.
+    The target can be a stage activation, input current, pre-reset membrane,
+    threshold margin, soft firing probability, or spike tensor. The module
+    consumes only current/past states and predicts the next timestep.
     """
 
     def __init__(
@@ -108,36 +109,29 @@ class FutureStatePredictor(nn.Module):
         return x / scale
 
     def _motion_extrapolation(self, src: torch.Tensor) -> torch.Tensor:
-        if self.spatial:
-            current = src[:, :, -self.channels :]
-            previous = src[:, :, -2 * self.channels : -self.channels]
-        else:
-            current = src[:, :, -self.channels :]
-            previous = src[:, :, -2 * self.channels : -self.channels]
+        current = src[:, :, -self.channels :]
+        previous = src[:, :, -2 * self.channels : -self.channels]
         return self.motion_a * current + self.motion_b * (current - previous)
 
     def forward_sequence(
         self,
         x: torch.Tensor,
-        loss_type: PredictionLossType = "l1",
+        loss_type: PredictionLossType = "smooth_l1",
         stop_gradient_target: bool = True,
         normalize_error: bool = True,
         normalize_loss: bool = False,
         amplitude_loss_weight: float = 0.0,
     ) -> PredictionBatch:
         src, target = self.make_history(x)
-        if stop_gradient_target:
-            target_for_loss = target.detach()
-        else:
-            target_for_loss = target
+        target_for_loss = target.detach() if stop_gradient_target else target
         if self.predictor_type == "motion_extrapolation":
             pred = self._motion_extrapolation(src)
         elif self.spatial:
-            Tm1, B, Ck, H, W = src.shape
-            pred = self.net(src.flatten(0, 1)).reshape(Tm1, B, self.channels, H, W)
+            tm1, bsz, _, height, width = src.shape
+            pred = self.net(src.flatten(0, 1)).reshape(tm1, bsz, self.channels, height, width)
         else:
-            Tm1, B, Ck = src.shape
-            pred = self.net(src.reshape(Tm1 * B, Ck)).reshape(Tm1, B, self.channels)
+            tm1, bsz, c_hist = src.shape
+            pred = self.net(src.reshape(tm1 * bsz, c_hist)).reshape(tm1, bsz, self.channels)
         base_loss_type = loss_type
         if str(loss_type).startswith("normalized_"):
             normalize_loss = True
@@ -146,10 +140,10 @@ class FutureStatePredictor(nn.Module):
         target_for_base_loss = self._normalize_for_loss(target_for_loss) if normalize_loss else target_for_loss
         if base_loss_type == "mse":
             raw = F.mse_loss(pred_for_loss, target_for_base_loss, reduction="none")
-        elif base_loss_type == "smooth_l1":
-            raw = F.smooth_l1_loss(pred_for_loss, target_for_base_loss, reduction="none")
-        else:
+        elif base_loss_type == "l1":
             raw = F.l1_loss(pred_for_loss, target_for_base_loss, reduction="none")
+        else:
+            raw = F.smooth_l1_loss(pred_for_loss, target_for_base_loss, reduction="none")
         per_sample = raw.flatten(2).mean(dim=2)
         timestep_loss = per_sample.mean(dim=1)
         base_loss = per_sample.mean()
@@ -182,63 +176,3 @@ class FutureStatePredictor(nn.Module):
             timestep_target_abs=target_abs.mean(dim=1).detach(),
             timestep_prediction_abs=prediction_abs.mean(dim=1).detach(),
         )
-
-    def predict_current_from_past(self, x: torch.Tensor) -> torch.Tensor:
-        r"""Return \hat{x}_t for t>=1 from previous states; x_0 is copied.
-
-        This is used by error-gated modulation. The prediction is causal: no
-        state at timestep t is used to predict timestep t.
-        """
-        if x.shape[0] < 2:
-            return x.detach()
-        pred_next = self.forward_sequence(x, stop_gradient_target=True).prediction.detach()
-        pred_current = torch.cat([x[:1].detach(), pred_next], dim=0)
-        return pred_current
-
-
-class ErrorGateModulator(nn.Module):
-    """Use prediction error to modulate a latent stage output."""
-
-    def __init__(
-        self,
-        channels: int,
-        spatial: bool = True,
-        mode: str = "membrane_gain",
-        alpha: float = 0.1,
-    ) -> None:
-        super().__init__()
-        self.channels = channels
-        self.spatial = spatial
-        self.mode = mode
-        self.alpha = float(alpha)
-        if spatial:
-            self.gate = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
-        else:
-            self.gate = nn.Linear(channels, channels)
-
-    def forward(self, x: torch.Tensor, predicted_current: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        err = (x - predicted_current).abs()
-        if self.spatial:
-            T, B, C, H, W = err.shape
-            gate = torch.sigmoid(self.gate(err.flatten(0, 1))).reshape(T, B, C, H, W)
-        else:
-            T, B, C = err.shape
-            gate = torch.sigmoid(self.gate(err.reshape(T * B, C))).reshape(T, B, C)
-        if self.mode == "residual_suppression":
-            y = x - self.alpha * predicted_current * gate
-        elif self.mode in {"threshold_modulation", "adaptive_threshold"}:
-            # Post-stage approximation of a lower threshold: high prediction error
-            # amplifies the current latent response without changing LIF internals.
-            effective_threshold = (1.0 - self.alpha * gate).clamp_min(0.05)
-            y = x / effective_threshold
-        elif self.mode == "error_only":
-            y = x * (1.0 - self.alpha) + self.alpha * err
-        else:  # membrane_gain
-            y = x * (1.0 + self.alpha * gate)
-        stats = {
-            "gate_mean": gate.detach().mean(),
-            "gate_std": gate.detach().std(unbiased=False),
-            "error_mean": err.detach().mean(),
-            "modulated_abs_mean": y.detach().abs().mean(),
-        }
-        return y, stats

@@ -1,7 +1,7 @@
-"""Predictive Error-Gated Spiking Transformer (PEG-ST).
+"""Predictive Membrane-Aware Spiking Dynamics for QKFormer.
 
-A research scaffold for predictive-coding inspired Spiking Transformers on
-DVS/event-based vision datasets.
+A research scaffold for auditing internal SNN dynamics and testing whether
+membrane-aware predictive signals are causal and decision-useful.
 """
 
 __version__ = "0.1.0"
