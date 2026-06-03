@@ -22,7 +22,7 @@ from pegst.probing.metrics import (
     relative_gain,
     transform_sequence,
 )
-from pegst.probing.targets import TargetTensor, collect_targets_from_batch
+from pegst.probing.targets import collect_targets_from_batch, predictor_tensor, select_target_item
 from pegst.utils.checkpoint import load_model_checkpoint
 from pegst.utils.config import load_config
 from pegst.utils.io import write_csv, write_json
@@ -38,10 +38,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--output-dir", required=True)
     p.add_argument("--targets", nargs="+", default=DEFAULT_TARGETS)
-    p.add_argument("--stages", nargs="+", default=["stage1", "stage2"])
+    p.add_argument("--stages", nargs="+", default=["patch_embed1", "stage1", "patch_embed2", "stage2"])
     p.add_argument("--layer-patterns", nargs="*", default=None)
     p.add_argument("--audit-csv", default="")
     p.add_argument("--require-passes-m1", action="store_true")
+    p.add_argument("--audit-split", default="test", choices=["train", "test", "both", "any"])
     p.add_argument("--modes", nargs="+", default=["normal", "shuffle", "reverse"], choices=["normal", "shuffle", "reverse"])
     p.add_argument("--train-mode", default="normal", choices=["normal", "shuffle", "reverse"])
     p.add_argument("--eval-splits", nargs="+", default=["train", "test"], choices=["train", "test"])
@@ -66,33 +67,21 @@ def truthy(value: Any) -> bool:
     return str(value).lower() in {"true", "1", "yes", "y"}
 
 
-def audit_candidates(path: str | Path, require_pass: bool) -> set[tuple[str, str, str]]:
+def audit_candidates(path: str | Path, require_pass: bool, audit_split: str = "test") -> set[tuple[str, str, str]]:
     if not path:
         return set()
-    out: set[tuple[str, str, str]] = set()
+    by_split: dict[tuple[str, str, str], set[str]] = {}
     with Path(path).open(newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
             if require_pass and not truthy(row.get("passes_m1", "")):
                 continue
-            out.add((row["target"], row["stage"], row["layer"]))
-    return out
-
-
-def predictor_tensor(x: torch.Tensor) -> tuple[torch.Tensor, bool]:
-    if x.dim() == 5:
-        return x, True
-    if x.dim() == 4:
-        return x.unsqueeze(-1), True
-    if x.dim() == 3:
-        return x, False
-    raise ValueError(f"Unsupported target tensor shape for prediction: {tuple(x.shape)}")
-
-
-def select_item(items: list[TargetTensor], target: str, stage: str, layer: str) -> TargetTensor | None:
-    for item in items:
-        if item.target == target and item.stage == stage and item.layer == layer:
-            return item
-    return None
+            key = (row["target"], row["stage"], row["layer"])
+            by_split.setdefault(key, set()).add(row.get("split", ""))
+    if audit_split == "any":
+        return set(by_split)
+    if audit_split == "both":
+        return {key for key, splits in by_split.items() if {"train", "test"}.issubset(splits)}
+    return {key for key, splits in by_split.items() if audit_split in splits}
 
 
 @torch.no_grad()
@@ -154,7 +143,7 @@ def target_batches(
                 layer_patterns=[candidate["layer"]],
                 soft_firing_temperature=args.soft_firing_temperature,
             )
-            item = select_item(items, candidate["target"], candidate["stage"], candidate["layer"])
+            item = select_target_item(items, candidate["target"], candidate["stage"], candidate["layer"])
             if item is None:
                 continue
             z, _ = predictor_tensor(item.tensor.detach())
@@ -389,7 +378,7 @@ def main() -> None:
 
     train_loader = build_dataloader(cfg["dataset"], "train")
     eval_loaders = {split: build_dataloader(cfg["dataset"], split) for split in args.eval_splits}
-    allowed = audit_candidates(args.audit_csv, args.require_passes_m1)
+    allowed = audit_candidates(args.audit_csv, args.require_passes_m1, args.audit_split)
     candidates = discover_candidates(model, train_loader, device, args, allowed)
     if not candidates:
         raise RuntimeError("No target candidates discovered. Check --targets, --stages, --layer-patterns, or --audit-csv.")
@@ -436,7 +425,7 @@ def main() -> None:
                                 layer_patterns=[candidate["layer"]],
                                 soft_firing_temperature=args.soft_firing_temperature,
                             )
-                            item = select_item(items, candidate["target"], candidate["stage"], candidate["layer"])
+                            item = select_target_item(items, candidate["target"], candidate["stage"], candidate["layer"])
                             if item is None:
                                 continue
                             z, _ = predictor_tensor(item.tensor.detach())

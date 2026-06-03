@@ -57,6 +57,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--copy-gain-threshold", type=float, default=0.05)
     p.add_argument("--autocorr-threshold", type=float, default=0.2)
     p.add_argument("--temporal-selectivity-threshold", type=float, default=1.03)
+    p.add_argument("--reverse-sanity-min", type=float, default=0.95)
+    p.add_argument("--reverse-sanity-max", type=float, default=1.05)
     p.add_argument("--near-zero-max", type=float, default=0.95)
     return p.parse_args()
 
@@ -121,10 +123,8 @@ def build_decision_rows(
         not_zero_dominated = dist.get("near_zero_fraction", 1.0) <= args.near_zero_max
         passes_copy = copy_gain >= args.copy_gain_threshold
         passes_autocorr = corr.get("autocorr_lag1", float("nan")) >= args.autocorr_threshold
-        passes_temporal = (
-            shuffle_sel >= args.temporal_selectivity_threshold
-            and reverse_sel >= args.temporal_selectivity_threshold
-        )
+        passes_temporal_shuffle = shuffle_sel >= args.temporal_selectivity_threshold
+        passes_reverse_sanity = args.reverse_sanity_min <= reverse_sel <= args.reverse_sanity_max
         row = {
             "split": split,
             "target": target,
@@ -145,7 +145,9 @@ def build_decision_rows(
             "finite_fraction": dist.get("finite_fraction", float("nan")),
             "passes_copy_beats_zero": passes_copy,
             "passes_autocorr": passes_autocorr,
-            "passes_temporal_order": passes_temporal,
+            "passes_temporal_shuffle": passes_temporal_shuffle,
+            "passes_reverse_sanity": passes_reverse_sanity,
+            "passes_temporal_order": passes_temporal_shuffle,
             "passes_amplitude": amplitude_ok,
             "passes_not_zero_dominated": not_zero_dominated,
             "passes_no_nan": finite_ok,
@@ -304,7 +306,8 @@ def main() -> None:
         {
             "copy_beats_zero": f"relative_gain_copy_vs_zero_raw_error_mean >= {args.copy_gain_threshold}",
             "autocorr": f"autocorr_lag1 >= {args.autocorr_threshold}",
-            "temporal_order": f"shuffle and reverse copy raw-error selectivity >= {args.temporal_selectivity_threshold}",
+            "temporal_order": f"shuffle copy raw-error selectivity >= {args.temporal_selectivity_threshold}",
+            "reverse_sanity": f"{args.reverse_sanity_min} <= reverse copy raw-error selectivity <= {args.reverse_sanity_max}",
             "not_zero_dominated": f"near_zero_fraction <= {args.near_zero_max}",
             "amplitude": "abs_mean > 1e-6",
             "no_nan": "finite_fraction == 1.0",
