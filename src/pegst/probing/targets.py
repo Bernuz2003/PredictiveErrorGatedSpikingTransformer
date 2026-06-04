@@ -71,6 +71,7 @@ def collect_targets_from_batch(
     target_list = list(targets)
     stage_set = set(stages or [])
     need_internal = any(target in INTERNAL_TARGET_MAP for target in target_list)
+    need_latent = "latent_post_stage" in target_list
     record_targets = internal_record_targets(target_list)
     collector = InternalStateCollector(
         model,
@@ -81,7 +82,11 @@ def collect_targets_from_batch(
         soft_firing_temperature=soft_firing_temperature,
     )
     if need_internal:
-        out, internal_states, profile = collector.forward_and_collect(x, return_features=True, return_timestep_logits=True)
+        out, internal_states, profile = collector.forward_and_collect(
+            x,
+            return_features=need_latent,
+            return_timestep_logits=True,
+        )
     else:
         out = model(x, return_features=True, return_timestep_logits=True)
         internal_states = {}
@@ -93,7 +98,10 @@ def collect_targets_from_batch(
         for name in LATENT_FEATURES:
             if name not in features or not _stage_allowed(name, stage_set):
                 continue
-            items.append(TargetTensor(target="latent_post_stage", stage=name, layer=name, tensor=features[name].detach()))
+            tensor = features[name].detach()
+            if to_cpu:
+                tensor = tensor.cpu()
+            items.append(TargetTensor(target="latent_post_stage", stage=name, layer=name, tensor=tensor))
 
     for layer, target_map in sorted(internal_states.items()):
         stage = stage_from_module_name(layer)

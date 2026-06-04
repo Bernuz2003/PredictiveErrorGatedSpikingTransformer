@@ -56,6 +56,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--signal-quantiles", nargs="+", type=float, default=DEFAULT_SIGNAL_QUANTILES)
     p.add_argument("--error-quantiles", nargs="+", type=float, default=DEFAULT_ERROR_QUANTILES)
     p.add_argument("--soft-firing-temperature", type=float, default=0.25)
+    p.add_argument("--batch-size", type=int, default=None, help="Optional dataloader batch-size override.")
+    p.add_argument("--record-to-cpu", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--empty-cache-each-batch", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--max-accuracy-drop", type=float, default=0.5, help="Percent points.")
     p.add_argument("--target-sops-fraction", type=float, default=0.70)
     p.add_argument("--include-confidence-only", action=argparse.BooleanOptionalAction, default=True)
@@ -349,6 +352,8 @@ def collect_run_data(
     log(f"[{run_name}] loading checkpoint")
     load_info = load_model_checkpoint(model, checkpoint_path, strict=bool(cfg.get("eval_strict", False)))
     model.eval()
+    if args.batch_size is not None:
+        cfg["dataset"]["batch_size"] = int(args.batch_size)
     loader = build_dataloader(cfg["dataset"], args.split)
     T_cfg = int(cfg.get("model", {}).get("T", cfg.get("timesteps", cfg.get("dataset", {}).get("T", 0))))
     targets = list(dict.fromkeys(args.targets))
@@ -382,6 +387,7 @@ def collect_run_data(
                 stages=args.stages,
                 layer_patterns=layer_patterns,
                 soft_firing_temperature=args.soft_firing_temperature,
+                to_cpu=bool(args.record_to_cpu),
             )
             logits = out["logits"]
             timestep_logits = out["timestep_logits"]
@@ -433,6 +439,9 @@ def collect_run_data(
                     f"samples={sum(int(v.numel()) for v in labels_chunks)}, "
                     f"candidate_signals={len(error_chunks)}, elapsed={timer.elapsed_str()}"
                 )
+            del items, out, logits, timestep_logits, probs_t, confidence_t, pred_t, full_pred, x, y
+            if args.empty_cache_each_batch and device.type == "cuda":
+                torch.cuda.empty_cache()
 
     if not labels_chunks:
         raise RuntimeError(f"[{run_name}] no samples collected.")
